@@ -1,40 +1,67 @@
-data "aws_ami" "amazon_linux2" {
-  most_recent = true
-  owners      = ["amazon"]
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
-  }
-}
+# main.tf
 
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.1.0"
+
+  name = var.vpc_name
+  cidr = var.vpc_cidr
+
+  azs             = var.azs
+  public_subnets  = var.public_subnets
+  private_subnets = var.private_subnets
+
+  enable_nat_gateway   = true
+  single_nat_gateway   = true
   enable_dns_hostnames = true
-  tags                 = local.tags
+  enable_dns_support   = true
+
+  tags = var.tags
 }
 
-resource "aws_subnet" "main" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[0]
-  tags                    = local.tags
+module "eks" {
+  source          = "terraform-aws-modules/eks/aws"
+  version         = "20.8.4"
+
+  cluster_name    = var.cluster_name
+  cluster_version = var.kubernetes_version
+  cluster_endpoint_public_access = true
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.private_subnets
+
+  enable_irsa = true
+
+  eks_managed_node_group_defaults = {
+    ami_type       = "AL2_x86_64"
+    instance_types = [var.node_instance_type]
+  }
+
+  eks_managed_node_groups = {
+    default = {
+      min_size     = var.node_min_size
+      max_size     = var.node_max_size
+      desired_size = var.node_desired_size
+      instance_types = [var.node_instance_type]
+      subnet_ids     = module.vpc.private_subnets
+      tags = var.tags
+    }
+  }
+
+  tags = var.tags
 }
 
-data "aws_availability_zones" "available" {}
-
-resource "aws_security_group" "ec2" {
-  name        = "${local.name_prefix}-sg"
-  description = "Allow SSH inbound traffic"
-  vpc_id      = aws_vpc.main.id
+resource "aws_security_group" "eks_additional" {
+  name        = "eks_additional_sg"
+  description = "Additional security group for EKS nodes"
+  vpc_id      = module.vpc.vpc_id
 
   ingress {
-    description = "SSH from allowed CIDR"
-    from_port   = 22
-    to_port     = 22
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = [var.allowed_ssh_cidr]
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS"
   }
 
   egress {
@@ -42,59 +69,13 @@ resource "aws_security_group" "ec2" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
   }
 
-  tags = local.tags
+  tags = var.tags
 }
 
-resource "aws_iam_role" "ec2" {
-  name = "${local.name_prefix}-role"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
-  tags = local.tags
-}
-
-data "aws_iam_policy_document" "ec2_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role_policy" "ec2_least_privilege" {
-  name = "${local.name_prefix}-least-privilege"
-  role = aws_iam_role.ec2.id
-  policy = data.aws_iam_policy_document.least_privilege.json
-}
-
-data "aws_iam_policy_document" "least_privilege" {
-  statement {
-    actions   = ["ec2:DescribeInstances"]
-    resources = ["*"]
-    effect    = "Allow"
-  }
-}
-
-resource "aws_iam_instance_profile" "ec2" {
-  name = "${local.name_prefix}-profile"
-  role = aws_iam_role.ec2.name
-}
-
-resource "aws_instance" "main" {
-  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.amazon_linux2.id
-  instance_type               = var.instance_type
-  subnet_id                   = aws_subnet.main.id
-  vpc_security_group_ids      = [aws_security_group.ec2.id]
-  key_name                    = var.key_name
-  iam_instance_profile        = aws_iam_instance_profile.ec2.name
-
-  root_block_device {
-    encrypted   = true
-    volume_size = 20
-    volume_type = "gp3"
-  }
-
-  tags = local.tags
+resource "aws_eks_cluster_security_group_attachment" "additional" {
+  cluster_name       = module.eks.cluster_name
+  security_group_id  = aws_security_group.eks_additional.id
 }
